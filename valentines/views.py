@@ -5,6 +5,9 @@ from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
+import re
+from datetime import datetime, timedelta
+from django.utils import timezone
 from .models import Valentine
 from .mpesa import MpesaClient
 from .serializers import (
@@ -334,50 +337,173 @@ class ValentineViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def submit_manual_payment(self, request, slug=None):
         """
-        Submit a manual M-Pesa transaction code
+        Submit a manual M-Pesa transaction message/code
         POST /api/valentines/{slug}/submit_manual_payment/
         """
         valentine = self.get_object()
-        mpesa_code = request.data.get('code', '').strip().upper()
+        raw_input = request.data.get('code', '').strip()
         
-        if not mpesa_code:
-            return Response({'success': False, 'message': 'M-Pesa confirmation code is required'}, status=400)
+        if not raw_input:
+            return Response({'success': False, 'message': 'M-Pesa message or code is required'}, status=400)
+
+        # If it's just a code (length ~10 and no spaces)
+        if len(raw_input) < 15 and ' ' not in raw_input:
+            mpesa_code = raw_input.upper()
+            is_full_message = False
+        else:
+            # It's a full message, parse it
+            is_full_message = True
+            parsed_data, error = self._parse_mpesa_message(raw_input)
+            if error:
+                return Response({'success': False, 'message': error}, status=400)
             
-        if len(mpesa_code) < 8:
-            return Response({'success': False, 'message': 'Please enter a valid M-Pesa code (e.g., SBN8SDF92)'}, status=400)
+            mpesa_code = parsed_data['code']
+            amount = parsed_data['amount']
+            trans_time = parsed_data['datetime']
+            is_correct_recipient = parsed_data['recipient']
+
+            # 1. Check Recipient
+            if not is_correct_recipient:
+                return Response({
+                    'success': False, 
+                    'message': 'Transaction message does not show "ANDREW MUSILI" as the recipient. Please verify.'
+                }, status=400)
+
+            # 2. Check Amount
+            expected_amount = self._get_expected_price(valentine.template_type)
+            if amount < expected_amount:
+                return Response({
+                    'success': False, 
+                    'message': f'Incomplete payment. Template requires KES {expected_amount}, but message shows KES {amount}.'
+                }, status=400)
+
+            # 3. Check Time (within 25 minutes)
+            now = timezone.now()
+            if trans_time < now - timedelta(minutes=25):
+                 return Response({
+                    'success': False, 
+                    'message': 'This transaction message is too old (older than 25 mins). Please send a recent payment.'
+                }, status=400)
+            
+            if trans_time > now + timedelta(minutes=5): # Small buffer for clock drift
+                return Response({
+                    'success': False, 
+                    'message': 'Invalid transaction time (in the future).'
+                }, status=400)
 
         # Check for duplicates
         if Valentine.objects.filter(mpesa_code=mpesa_code).exclude(pk=valentine.pk).exists():
-             return Response({'success': False, 'message': 'This code has already been used.'}, status=400)
+             return Response({
+                 'success': False, 
+                 'message': 'This transaction code has already been used. If you have issues, WhatsApp Andrew Musili for help.'
+             }, status=400)
 
         valentine.mpesa_code = mpesa_code
-        valentine.is_paid = True # Mark as paid immediately for viral growth, but store the code
-        valentine.is_pending_verification = True # Mark for admin review
+        valentine.is_paid = True 
+        valentine.is_pending_verification = True 
+        valentine.amount_paid = amount if 'amount' in locals() else 0
         valentine.save()
         
         return Response({
             'success': True,
-            'message': 'Payment confirmed! Your Valentine is now live. ❤️',
+            'message': 'Payment verified! Your Valentine is now live. ❤️',
             'data': {
                 'is_paid': valentine.is_paid,
                 'slug': valentine.slug
             }
         })
 
+    def _get_expected_price(self, template_type):
+        if template_type == 'poem': return 500
+        if template_type == 'love_letter': return 350
+        return 250
+
+    def _parse_mpesa_message(self, message):
+        """Helper to parse M-Pesa confirmation text"""
+        # Clean message (remove excessive spaces/newlines)
+        message = ' '.join(message.split())
+        
+        # 1. Extract Code (Starts with 10 chars)
+        # e.g. UBEG76GMIO Confirmed.
+        code_match = re.search(r'^([A-Z0-9]{10})\s+Confirmed\.', message)
+        if not code_match:
+            # Fallback for code anywhere if format slightly off
+            code_match = re.search(r'([A-Z0-9]{10})', message)
+            if not code_match:
+                return None, "Could not find a valid M-Pesa transaction code in the message."
+        
+        code = code_match.group(1)
+        
+        # 2. Extract Amount
+        # e.g. Ksh250.00
+        amount_match = re.search(r'Ksh([\d,]+\.?\d*)', message)
+        if not amount_match:
+            return None, "Could not extract payment amount from the message."
+        
+        try:
+            amount_str = amount_match.group(1).replace(',', '')
+            amount = float(amount_str)
+        except ValueError:
+            return None, "Invalid amount format in message."
+            
+        # 3. Extract Date and Time
+        # e.g. on 14/2/26 at 8:28 AM
+        date_match = re.search(r'on\s+(\d{1,2}/\d{1,2}/\d{2,4})\s+at\s+(\d{1,2}:\d{2}\s+[AP]M)', message)
+        if not date_match:
+            return None, "Could not find transaction date and time."
+        
+        date_str = date_match.group(1)
+        time_str = date_match.group(2)
+        
+        try:
+            dt_str = f"{date_str} {time_str}"
+            parts = date_str.split('/')
+            if len(parts[-1]) == 2:
+                fmt = "%d/%m/%y %I:%M %p"
+            else:
+                fmt = "%d/%m/%Y %I:%M %p"
+            
+            # Using current timezone for parsing
+            dt = datetime.strptime(dt_str, fmt)
+            dt = timezone.make_aware(dt, timezone.get_current_timezone())
+        except Exception as e:
+            return None, f"Date format error: {str(e)}"
+            
+        return {
+            'code': code,
+            'amount': amount,
+            'datetime': dt,
+            'recipient': "ANDREW MUSILI" in message.upper()
+        }, None
+
     @action(detail=True, methods=['post'])
     def reveal_manual_payment(self, request, slug=None):
         """
-        Submit code to reveal answer
+        Submit message to reveal answer
         POST /api/valentines/{slug}/reveal_manual_payment/
         """
         valentine = self.get_object()
-        mpesa_code = request.data.get('code', '').strip().upper()
+        raw_input = request.data.get('code', '').strip()
         
-        if not mpesa_code:
-            return Response({'success': False, 'message': 'M-Pesa code required'}, status=400)
+        if not raw_input:
+            return Response({'success': False, 'message': 'M-Pesa message required'}, status=400)
             
-        # For reveal, we can just return the answer once they provide ANY code
-        # In a real app, you'd verify it first.
+        # Simple parse for reveal (only need to see if it's a message and if it has a code)
+        if 'CONFIRMED' in raw_input.upper():
+            parsed, error = self._parse_mpesa_message(raw_input)
+            if error: return Response({'success': False, 'message': error}, status=400)
+            mpesa_code = parsed['code']
+            
+            # Check price for reveal (Skip for now or set to fixed 350)
+            if parsed['amount'] < 350:
+                 return Response({'success': False, 'message': 'Reveal requires KES 350.'}, status=400)
+        else:
+            mpesa_code = raw_input.upper()
+
+        # Check for duplicates
+        if Valentine.objects.filter(mpesa_code=mpesa_code).exclude(pk=valentine.pk).exists():
+             return Response({'success': False, 'message': 'This code has already been used.'}, status=400)
+
         valentine.mpesa_code = mpesa_code
         valentine.save()
         
