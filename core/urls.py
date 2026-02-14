@@ -19,10 +19,21 @@ from django.contrib import admin
 from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
+from django.http import JsonResponse
+
+def health_check(request):
+    return JsonResponse({
+        "status": "healthy", 
+        "service": "ValenAI Backend",
+        "message": "Welcome to the Valentine AI API. Root is live!"
+    })
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path("api/", include("valentines.urls")),
+    path("api/", include("valentines.urls")), # Legacy/Standard support
+    path("", include("valentines.urls")),    # Frontend current support (missing /api)
+    path("", health_check),                  # Root health check
+    path("health/", health_check),           # Explicit health check
 ]
 
 if settings.DEBUG:
