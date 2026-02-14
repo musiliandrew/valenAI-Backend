@@ -337,22 +337,19 @@ class ValentineViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def submit_manual_payment(self, request, slug=None):
         """
-        Submit a manual M-Pesa transaction message/code
+        Submit a manual payment (M-Pesa message/code or PayPal ID)
         POST /api/valentines/{slug}/submit_manual_payment/
         """
         valentine = self.get_object()
         raw_input = request.data.get('code', '').strip()
         
         if not raw_input:
-            return Response({'success': False, 'message': 'M-Pesa message or code is required'}, status=400)
+            return Response({'success': False, 'message': 'Payment details (M-Pesa message or PayPal ID) are required'}, status=400)
 
-        # If it's just a code (length ~10 and no spaces)
-        if len(raw_input) < 15 and ' ' not in raw_input:
-            mpesa_code = raw_input.upper()
-            is_full_message = False
-        else:
-            # It's a full message, parse it
-            is_full_message = True
+        # 1. Try M-Pesa Parsing First
+        is_mpesa = 'CONFIRMED' in raw_input.upper()
+        
+        if is_mpesa:
             parsed_data, error = self._parse_mpesa_message(raw_input)
             if error:
                 return Response({'success': False, 'message': error}, status=400)
@@ -362,14 +359,14 @@ class ValentineViewSet(viewsets.ModelViewSet):
             trans_time = parsed_data['datetime']
             is_correct_recipient = parsed_data['recipient']
 
-            # 1. Check Recipient
+            # Check Recipient
             if not is_correct_recipient:
                 return Response({
                     'success': False, 
                     'message': 'Transaction message does not show "ANDREW MUSILI" as the recipient. Please verify.'
                 }, status=400)
 
-            # 2. Check Amount
+            # Check Amount
             expected_amount = self._get_expected_price(valentine.template_type)
             if amount < expected_amount:
                 return Response({
@@ -377,7 +374,7 @@ class ValentineViewSet(viewsets.ModelViewSet):
                     'message': f'Incomplete payment. Template requires KES {expected_amount}, but message shows KES {amount}.'
                 }, status=400)
 
-            # 3. Check Time (within 25 minutes)
+            # Check Time (within 25 minutes)
             now = timezone.now()
             if trans_time < now - timedelta(minutes=25):
                  return Response({
@@ -385,28 +382,35 @@ class ValentineViewSet(viewsets.ModelViewSet):
                     'message': 'This transaction message is too old (older than 25 mins). Please send a recent payment.'
                 }, status=400)
             
-            if trans_time > now + timedelta(minutes=5): # Small buffer for clock drift
+            if trans_time > now + timedelta(minutes=5): 
                 return Response({
                     'success': False, 
                     'message': 'Invalid transaction time (in the future).'
                 }, status=400)
+        else:
+            # 2. Fallback for PayPal/Manual IDs
+            # If it's not a full M-Pesa message, just treat it as a code
+            mpesa_code = raw_input.upper() if len(raw_input) < 50 else raw_input[:50]
+            amount = 0 # Will be verified manually later
 
         # Check for duplicates
         if Valentine.objects.filter(mpesa_code=mpesa_code).exclude(pk=valentine.pk).exists():
              return Response({
                  'success': False, 
-                 'message': 'This transaction code has already been used. If you have issues, WhatsApp Andrew Musili for help.'
+                 'message': 'This transaction has already been used. If you have issues, WhatsApp Andrew Musili for help.'
              }, status=400)
 
         valentine.mpesa_code = mpesa_code
         valentine.is_paid = True 
         valentine.is_pending_verification = True 
-        valentine.amount_paid = amount if 'amount' in locals() else 0
+        # Don't overwrite amount if already set, or if it's 0 use what we parsed
+        if amount > 0:
+            valentine.amount_paid = amount
         valentine.save()
         
         return Response({
             'success': True,
-            'message': 'Payment verified! Your Valentine is now live. ❤️',
+            'message': 'Payment details received! Your Valentine is now live. ❤️' if not is_mpesa else 'Payment verified! Your Valentine is now live. ❤️',
             'data': {
                 'is_paid': valentine.is_paid,
                 'slug': valentine.slug
